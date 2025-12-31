@@ -1,0 +1,220 @@
+// 引入依赖
+const schedule = require('node-schedule');
+const { exec } = require('child_process');
+const fs = require('fs');
+const path = require('path');
+
+// ===================== 配置项（根据你的实际环境修改） =====================
+const MYSQL_CONFIG = {
+  host: 'localhost',
+  port: 3306,
+  user: 'root',
+  password: 'your_mysql_password',
+  database: 'test-management-system',
+  charset: 'utf8mb4'
+};
+
+// 备份文件存储目录
+const BACKUP_DIR = path.resolve(__dirname, '../backup/mysql');
+// 备份文件保留天数
+const BACKUP_KEEP_DAYS = 7;
+// =====================================================================
+
+/**
+ * 创建备份目录（若不存在则自动创建）
+ */
+const createBackupDir = () => {
+  if (!fs.existsSync(BACKUP_DIR)) {
+    fs.mkdirSync(BACKUP_DIR, { recursive: true });
+    console.log(`[MySQL 备份工具] 备份目录创建成功：${BACKUP_DIR}`);
+  }
+};
+
+/**
+ * 核心：执行 MySQL 备份
+ * @returns {Promise<void>}
+ */
+const backupMysql = async () => {
+  try {
+    createBackupDir();
+
+    // 生成备份文件名
+    const now = new Date();
+    const year = now.getFullYear();
+    const month = (now.getMonth() + 1).toString().padStart(2, '0');
+    const day = now.getDate().toString().padStart(2, '0');
+    const hour = now.getHours().toString().padStart(2, '0');
+    const minute = now.getMinutes().toString().padStart(2, '0');
+    const second = now.getSeconds().toString().padStart(2, '0');
+    const backupFileName = `${MYSQL_CONFIG.database}_${year}${month}${day}_${hour}${minute}${second}.sql`;
+    const backupFilePath = path.join(BACKUP_DIR, backupFileName);
+
+    // 拼接 mysqldump 命令（适配 MySQL8.0）
+    const mysqldumpCmd = `mysqldump -h${MYSQL_CONFIG.host} -P${MYSQL_CONFIG.port} -u${MYSQL_CONFIG.user} -p${MYSQL_CONFIG.password} --default-character-set=${MYSQL_CONFIG.charset} ${MYSQL_CONFIG.database} > ${backupFilePath}`;
+
+    console.log(`[MySQL 备份工具] 开始备份数据库：${MYSQL_CONFIG.database}`);
+    console.log(`[MySQL 备份工具] 备份命令：${mysqldumpCmd}`);
+    
+    exec(mysqldumpCmd, (error, stdout, stderr) => {
+      if (error) {
+        console.error(`[MySQL 备份工具] 备份失败：${error.message}`);
+        return;
+      }
+      if (stderr) {
+        console.warn(`[MySQL 备份工具] 备份警告：${stderr}`);
+      }
+      console.log(`[MySQL 备份工具] 备份成功！文件路径：${backupFilePath}`);
+    });
+  } catch (err) {
+    console.error(`[MySQL 备份工具] 备份异常：${err.message}`);
+  }
+};
+
+/**
+ * 新增：清理过期备份文件（保留 BACKUP_KEEP_DAYS 天内的文件）
+ */
+const cleanExpiredBackupFiles = () => {
+  try {
+    createBackupDir();
+
+    // 1. 计算 7 天前的时间戳（毫秒级）
+    const expiredTime = new Date().getTime() - (BACKUP_KEEP_DAYS * 24 * 60 * 60 * 1000);
+    console.log(`[MySQL 清理工具] 开始清理 ${BACKUP_KEEP_DAYS} 天前的过期备份文件，过期时间阈值：${new Date(expiredTime).toLocaleString()}`);
+
+    // 2. 读取备份目录下所有文件
+    fs.readdir(BACKUP_DIR, (err, files) => {
+      if (err) {
+        console.error(`[MySQL 清理工具] 读取备份目录失败：${err.message}`);
+        return;
+      }
+
+      // 3. 遍历文件，筛选并删除过期文件
+      files.forEach((file) => {
+        // 过滤非备份文件（仅处理以数据库名开头、.sql 或 .sql.gz 结尾的文件，避免误删）
+        const isBackupFile = file.startsWith(MYSQL_CONFIG.database) && (file.endsWith('.sql') || file.endsWith('.sql.gz'));
+        if (!isBackupFile) {
+          return;
+        }
+
+        // 文件完整路径
+        const filePath = path.join(BACKUP_DIR, file);
+        // 获取文件创建时间
+        fs.stat(filePath, (statErr, stats) => {
+          if (statErr) {
+            console.error(`[MySQL 清理工具] 获取文件信息失败（${file}）：${statErr.message}`);
+            return;
+          }
+
+          // 对比文件创建时间与过期时间
+          if (stats.birthtime.getTime() < expiredTime) {
+            // 删除过期文件
+            fs.unlink(filePath, (unlinkErr) => {
+              if (unlinkErr) {
+                console.error(`[MySQL 清理工具] 删除过期文件失败（${file}）：${unlinkErr.message}`);
+              } else {
+                console.log(`[MySQL 清理工具] 成功删除过期备份文件：${file}`);
+              }
+            });
+          }
+        });
+      });
+    });
+  } catch (err) {
+    console.error(`[MySQL 清理工具] 清理过期文件异常：${err.message}`);
+  }
+};
+
+/**
+ * 初始化定时任务（备份任务 + 过期文件清理任务）
+ */
+const initMysqlBackupSchedule = () => {
+  // ===================== 备份定时规则（12:30 / 22:30） =====================
+  // 规则1：每天 12:30:00 执行
+  const backupRule1 = new schedule.RecurrenceRule();
+  backupRule1.second = 0;
+  backupRule1.minute = 30;
+  backupRule1.hour = 12;
+
+  // 规则2：每天 22:30:00 执行
+  const backupRule2 = new schedule.RecurrenceRule();
+  backupRule2.second = 0;
+  backupRule2.minute = 30;
+  backupRule2.hour = 22;
+
+  // ===================== 清理定时规则（每天凌晨 00:00，避免与备份冲突） =====================
+  const cleanRule = new schedule.RecurrenceRule();
+  cleanRule.second = 0;
+  cleanRule.minute = 0;
+  cleanRule.hour = 0; // 凌晨 0 点执行
+
+  // ===================== 注册定时任务 =====================
+  // 备份任务1
+  schedule.scheduleJob(backupRule1, () => {
+    console.log(`[MySQL 备份定时任务] 触发 12:30 备份任务`);
+    backupMysql();
+  });
+
+  // 备份任务2
+  schedule.scheduleJob(backupRule2, () => {
+    console.log(`[MySQL 备份定时任务] 触发 22:30 备份任务`);
+    backupMysql();
+  });
+
+  // 过期文件清理任务
+  schedule.scheduleJob(cleanRule, () => {
+    console.log(`[MySQL 清理定时任务] 触发每日过期文件清理任务`);
+    cleanExpiredBackupFiles();
+  });
+
+  // 可选：服务启动时，立即执行一次清理（避免启动时存在大量过期文件）
+  cleanExpiredBackupFiles();
+
+  console.log(`[MySQL 备份定时任务] 初始化成功！`);
+  console.log(`- 备份配置：每天 12:30、22:30 自动备份数据库 ${MYSQL_CONFIG.database}`);
+  console.log(`- 清理配置：每天 00:00 自动清理 ${BACKUP_KEEP_DAYS} 天前的过期备份文件`);
+  console.log(`- 备份目录：${BACKUP_DIR}`);
+};
+
+// 导出工具方法
+module.exports = {
+  backupMysql,
+  cleanExpiredBackupFiles, // 手动触发清理（可选）
+  initMysqlBackupSchedule
+};
+
+
+/** 集成到 Express 项目中,在 Express 入口文件（通常是 app.js 或 index.js）中引入并初始化备份工具类，确保服务启动时定时任务生效。
+const express = require('express');
+const app = express();
+// 引入 MySQL 备份工具类
+const mysqlBackupUtil = require('./utils/mysqlBackupUtil');
+
+// ========== 其他 Express 配置（如路由、中间件等） ==========
+app.use(express.json());
+app.use(express.urlencoded({ extended: true }));
+
+// 示例路由 
+app.get('/', (req, res) => {
+  res.send('Express + MySQL 定时备份服务运行中...');
+});
+
+// ========== 初始化 MySQL 定时备份 ==========
+// 服务启动后，立即初始化定时任务
+mysqlBackupUtil.initMysqlBackupSchedule();
+
+// 可选：提供一个接口，手动触发备份（便于测试）
+app.get('/api/mysql/backup', async (req, res) => {
+  try {
+    await mysqlBackupUtil.backupMysql();
+    res.json({ code: 200, msg: 'MySQL 手动备份触发成功' });
+  } catch (err) {
+    res.json({ code: 500, msg: `MySQL 手动备份失败：${err.message}` });
+  }
+});
+
+// 启动 Express 服务
+const PORT = 3000;
+app.listen(PORT, () => {
+  console.log(`Express 服务运行在 http://localhost:${PORT}`);
+});
+**/
